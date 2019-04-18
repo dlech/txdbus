@@ -4,12 +4,14 @@ This module implements the wire-level DBus protocol.
 @author: Tom Cocagne
 """
 import os.path
+import socket
 import struct
 
 import six
 
 from twisted.internet import interfaces, protocol
 from twisted.python import log
+from twisted.python.sendmsg import SCM_RIGHTS, sendmsg
 from zope.interface import implementer, Interface
 
 from txdbus import error, message
@@ -70,7 +72,6 @@ class BasicDBusProtocol(protocol.Protocol):
     """
     _buffer = b''
     _receivedFDs = []
-    _toBeSentFDs = []
     _authenticated = False
     _nextMsgLen = 0
     _endian = '<'
@@ -152,7 +153,6 @@ class BasicDBusProtocol(protocol.Protocol):
                 data = data[1:]
 
                 if _is_linux:
-                    import socket
                     cd = self.transport.socket.getsockopt(
                         socket.SOL_SOCKET,
                         17,  # SO_PEERCRED
@@ -235,10 +235,18 @@ class BasicDBusProtocol(protocol.Protocol):
             connection
         """
         assert isinstance(msg, message.DBusMessage)
-        for fd in self._toBeSentFDs:
-            self.transport.sendFileDescriptor(fd)
-        self._toBeSentFDs = []
-        self.transport.write(msg.rawMessage)
+        if hasattr(msg, 'oobFDs') and msg.oobFDs:
+            sent = sendmsg(
+                self.transport.socket,
+                msg.rawMessage,
+                [(socket.SOL_SOCKET, SCM_RIGHTS, struct.pack(
+                    "i" * len(msg.oobFDs),
+                    *msg.oobFDs
+                ))]
+            )
+            assert sent == len(msg.rawMessage)
+        else:
+            self.transport.write(msg.rawMessage)
 
     def rawDBusMessageReceived(self, rawMsg):
         """
@@ -250,7 +258,12 @@ class BasicDBusProtocol(protocol.Protocol):
         m = message.parseMessage(rawMsg, self._receivedFDs)
         mt = m._messageType
 
-        self._receivedFDs = []
+        # only clear self._receivedFDs when the signature contains a unix fd
+        # helps avoid a race condition where another message can be received
+        # after we receive the unix fd but before the associated unix fd
+        # message is received
+        if m.signature and 'h' in m.signature:
+            self._receivedFDs = []
 
         if mt == 1:
             self.methodCallReceived(m)
